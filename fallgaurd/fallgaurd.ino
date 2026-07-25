@@ -38,3 +38,108 @@ uint32_t stillStartMs = 0;
 uint32_t lastAlertMs = 0;
 float prevAccelMagG = 1.0;
 float currentJerk = 0.0;
+
+)rawliteral";
+
+// ======================= HARDWARE SETUP =========================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // 1. Initialize MPU6050
+  Wire.begin(21, 22);
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 connection failed!");
+    while (1) { delay(10); }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+
+  // 2. Setup Wi-Fi Access Point
+  Serial.println("Setting up Access Point...");
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  // 3. Setup Web Server & SSE
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+  
+  events.onConnect([](AsyncEventSourceClient *client){
+    if(client->lastId()){
+      Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
+    }
+    client->send("Connected", NULL, millis(), 1000);
+  });
+  server.addHandler(&events);
+  server.begin();
+}
+
+// ======================= MAIN LOOP ==============================
+void loop() {
+  uint32_t currentMs = millis();
+
+  // Non-blocking sampling loop
+  if (currentMs - lastSampleMs >= SAMPLE_PERIOD_MS) {
+    lastSampleMs = currentMs;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Calculate magnitude of acceleration (1G = 9.8 m/s^2)
+    float accelMag = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z)) / 9.81;
+    currentJerk = abs(accelMag - prevAccelMagG);
+    prevAccelMagG = accelMag;
+
+    // --- State Machine Logic ---
+    switch (currentState) {
+      case WAITING_FOR_TUMBLE:
+        if (currentJerk > TUMBLE_JERK_G) {
+          currentState = TUMBLING;
+          tumbleStartMs = currentMs;
+        }
+        break;
+
+      case TUMBLING:
+        if (currentJerk < TUMBLE_JERK_G) {
+          // If tumbling stopped, check if it tumbled long enough
+          if (currentMs - tumbleStartMs > TUMBLE_MIN_MS) {
+            currentState = WAITING_FOR_STILL;
+            stillStartMs = currentMs;
+          } else {
+            currentState = WAITING_FOR_TUMBLE; // False alarm
+          }
+        }
+        break;
+
+      case WAITING_FOR_STILL:
+        if (abs(accelMag - 1.0) < STILL_ACCEL_DEV_G) {
+          if (currentMs - stillStartMs > STILL_MIN_MS) {
+            currentState = ALERTED;
+            lastAlertMs = currentMs;
+          }
+        } else {
+          // Moved again, break stillness check
+          currentState = WAITING_FOR_TUMBLE; 
+        }
+        break;
+
+      case ALERTED:
+        digitalWrite(LED_BUILTIN, HIGH);
+        if (currentMs - lastAlertMs > ALERT_COOLDOWN_MS) {
+          currentState = WAITING_FOR_TUMBLE; // Auto-reset after cooldown
+          digitalWrite(LED_BUILTIN, LOW);
+        }
+        break;
+    }
+
+    // --- Send Data to Web Dashboard ---
+    // Create a simple JSON string manually to avoid heavy JSON libraries
+    char jsonStr[100];
+    snprintf(jsonStr, sizeof(jsonStr), "{\"jerk\":%.2f, \"state\":%d}", currentJerk, currentState);
+    events.send(jsonStr, "sensor_update", millis());
+  }
+}
