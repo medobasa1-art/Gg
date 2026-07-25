@@ -39,8 +39,6 @@ uint32_t lastAlertMs = 0;
 float prevAccelMagG = 1.0;
 float currentJerk = 0.0;
 
-)rawliteral";
-
 // ======================= HARDWARE SETUP =========================
 void setup() {
   Serial.begin(115200);
